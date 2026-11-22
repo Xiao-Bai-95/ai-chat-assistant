@@ -1,0 +1,12 @@
+node_modules
+dist
+*.local
+.env
+.env.*
+!.env.example
+!.env.local.example
+*.log
+
+# IDE 与 WorkBuddy 内部配置
+.idea/
+.workbuddy/
