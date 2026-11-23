@@ -10,3 +10,7 @@ dist
 # IDE 与 WorkBuddy 内部配置
 .idea/
 .workbuddy/
+*.genie
+
+# 修改前备份（可删除）
+backups/

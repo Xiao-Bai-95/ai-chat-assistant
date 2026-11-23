@@ -25,14 +25,23 @@ export async function streamChat(
   onChunk: (chunk: string) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages: messages.map(({ role, content }) => ({ role, content })),
-    }),
-    signal,
-  })
+  let response: Response
+  try {
+    response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: messages.map(({ role, content }) => ({ role, content })),
+      }),
+      signal,
+    })
+  } catch (caught) {
+    const err = caught as Error
+    // 主动点击"停止"导致的中断，原样抛给上层按正常流程处理，不算错误
+    if (err.name === 'AbortError') throw err
+    // 断网、服务未启动、DNS 失败等网络层错误，转成友好的中文提示
+    throw new Error('网络连接失败，请检查网络或确认服务已启动（npm run dev）后重试')
+  }
 
   if (!response.ok) {
     let detail = ''

@@ -6,6 +6,13 @@ import { checkBackendStatus, type BackendStatus, streamChat } from '../api'
 import { clearMessages, loadMessages, saveMessages } from '../storage'
 import { createMessage, type Message } from '../types'
 
+/** 绑定到某条 AI 消息上的错误；retryHistory 存在时可显示"重试"按钮 */
+interface InlineError {
+  messageId: string
+  text: string
+  retryHistory: Message[]
+}
+
 const markdownComponents: Components = {
   code({ node: _node, className, children }) {
     const match = /language-([\w-]+)/.exec(className ?? '')
@@ -27,7 +34,8 @@ export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>(() => loadMessages())
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [messageError, setMessageError] = useState<InlineError | null>(null)
+  const [toast, setToast] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [backend, setBackend] = useState<BackendStatus | null>(null)
 
@@ -36,7 +44,10 @@ export default function ChatInterface() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
-    if (messages.length > 0) saveMessages(messages)
+    // 不把内容为空的 AI 占位写进本地，避免刷新后出现空气泡
+    const clean = messages.filter((m) => m.content.trim().length > 0)
+    if (clean.length > 0) saveMessages(clean)
+    else clearMessages()
   }, [messages])
 
   useEffect(() => {
@@ -49,18 +60,9 @@ export default function ChatInterface() {
       .catch(() => setBackend(null))
   }, [])
 
-  async function sendMessage() {
-    const text = input.trim()
-    if (!text || isLoading) return
-
-    setError(null)
-    setInput('')
-
-    const userMessage = createMessage('user', text)
-    const assistantMessage = createMessage('assistant', '')
-    const history = [...messages, userMessage]
-
-    setMessages([...history, assistantMessage])
+  /** 发起一次流式请求，把内容填入指定 id 的 AI 消息；失败时把错误绑定到这条消息 */
+  async function runChat(assistantId: string, history: Message[]) {
+    setMessageError(null)
     setIsLoading(true)
 
     const controller = new AbortController()
@@ -72,7 +74,7 @@ export default function ChatInterface() {
         (chunk) => {
           setMessages((prev) =>
             prev.map((message) =>
-              message.id === assistantMessage.id
+              message.id === assistantId
                 ? { ...message, content: message.content + chunk }
                 : message,
             ),
@@ -80,17 +82,24 @@ export default function ChatInterface() {
         },
         controller.signal,
       )
+      // 成功后移除可能残留的空占位
+      setMessages((prev) =>
+        prev.filter((message) => message.id !== assistantId || message.content.length > 0),
+      )
     } catch (caught) {
       const err = caught as Error
       if (err.name === 'AbortError') {
+        // 主动停止：移除空占位，不算错误
         setMessages((prev) =>
-          prev.filter((message) => message.id !== assistantMessage.id || message.content.length > 0),
+          prev.filter((message) => message.id !== assistantId || message.content.length > 0),
         )
       } else {
-        setError(err.message || '请求失败，请稍后重试')
-        setMessages((prev) =>
-          prev.filter((message) => message.id !== assistantMessage.id || message.content.length > 0),
-        )
+        // 失败：保留部分内容，并把错误绑定到这条消息，供气泡内显示 + 重试
+        setMessageError({
+          messageId: assistantId,
+          text: err.message || '请求失败，请稍后重试',
+          retryHistory: history,
+        })
       }
     } finally {
       setIsLoading(false)
@@ -99,15 +108,46 @@ export default function ChatInterface() {
     }
   }
 
+  function sendMessage() {
+    const text = input.trim()
+    if (!text || isLoading) return
+
+    setInput('')
+
+    const userMessage = createMessage('user', text)
+    const assistantMessage = createMessage('assistant', '')
+    const history = [...messages, userMessage]
+
+    setMessages([...history, assistantMessage])
+    void runChat(assistantMessage.id, history)
+  }
+
+  /** 点击消息气泡里的"重试"：清空这条 AI 消息并用原历史重新请求 */
+  function retryMessage(err: InlineError) {
+    if (isLoading) return
+    setMessages((prev) =>
+      prev.map((message) =>
+        message.id === err.messageId ? { ...message, content: '' } : message,
+      ),
+    )
+    void runChat(err.messageId, err.retryHistory)
+  }
+
   function stopGeneration() {
+    // 中断 fetch 请求；随后立即把 UI 恢复成未加载的样子
     abortRef.current?.abort()
+    abortRef.current = null
+    setIsLoading(false)
+    setMessageError(null)
+    textareaRef.current?.focus()
   }
 
   function handleClear() {
     abortRef.current?.abort()
     clearMessages()
     setMessages([])
-    setError(null)
+    setMessageError(null)
+    setToast(null)
     setInput('')
     textareaRef.current?.focus()
   }
@@ -120,7 +160,8 @@ export default function ChatInterface() {
         setCopiedId((id) => (id === message.id ? null : id))
       }, 1500)
     } catch {
-      setError('复制失败，请手动选择文本复制')
+      setToast('复制失败，请手动选择文本复制')
+      window.setTimeout(() => setToast(null), 3000)
     }
   }
 
@@ -160,9 +201,9 @@ export default function ChatInterface() {
         </div>
       )}
 
-      {error && (
-        <div role="alert" className="border-b border-red-200 bg-red-50 px-5 py-2 text-sm text-red-700">
-          {error}
+      {toast && (
+        <div role="status" className="border-b border-amber-200 bg-amber-50 px-5 py-2 text-sm text-amber-800">
+          {toast}
         </div>
       )}
 
@@ -200,6 +241,29 @@ export default function ChatInterface() {
                         ) : (
                           <div className="md-content">
                             <ReactMarkdown components={markdownComponents}>{message.content}</ReactMarkdown>
+                            {messageError?.messageId === message.id && (
+                              <div className="mt-2 flex items-center gap-2 border-t border-red-100 pt-2 text-xs text-slate-500">
+                                <svg
+                                  viewBox="0 0 24 24"
+                                  className="h-4 w-4 shrink-0 text-amber-500"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                >
+                                  <circle cx="12" cy="12" r="9" />
+                                  <path d="M12 8v5M12 16.5v.01" strokeLinecap="round" />
+                                </svg>
+                                <span className="min-w-0 flex-1">{messageError.text}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => retryMessage(messageError)}
+                                  className="shrink-0 rounded-md px-2 py-0.5 text-slate-500 transition hover:bg-slate-100 hover:text-blue-600"
+                                  title="重新发送这条消息"
+                                >
+                                  重试
+                                </button>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
@@ -262,7 +326,7 @@ export default function ChatInterface() {
                 type="button"
                 onClick={() => void sendMessage()}
                 disabled={!input.trim() || isLoading}
-                className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
+                className="min-w-[80px] rounded-xl bg-blue-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 发送
               </button>
@@ -270,9 +334,9 @@ export default function ChatInterface() {
                 <button
                   type="button"
                   onClick={stopGeneration}
-                  className="rounded-xl border border-slate-300 px-5 py-2 text-sm text-slate-600 transition hover:bg-slate-50"
+                  className="min-w-[80px] rounded-xl bg-red-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-red-700"
                 >
-                  停止
+                  停止生成
                 </button>
               )}
             </div>
